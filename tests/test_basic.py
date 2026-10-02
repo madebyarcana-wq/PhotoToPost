@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 import subprocess
 
@@ -72,7 +73,7 @@ def test_cli_no_ai(tmp_path):
 
 
 class FakeWriter:
-    def __init__(self, platforms, style_examples=None):
+    def __init__(self, platforms, style_examples=None, backend="claude-code"):
         self.platforms = platforms
 
     def analyze(self, item, frames, duration=None, use_location=False, note=None):
@@ -87,7 +88,7 @@ class FakeWriter:
 
 
 def test_cli_with_mocked_ai(tmp_path, monkeypatch):
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "test")
+    monkeypatch.setattr("phototopost.cli.shutil.which", lambda name: "/usr/bin/" + name)
     monkeypatch.setattr("phototopost.pipeline.CaptionWriter", FakeWriter)
     src = tmp_path / "photos"
     src.mkdir()
@@ -103,7 +104,7 @@ def test_cli_with_mocked_ai(tmp_path, monkeypatch):
 
 @pytest.mark.skipif(not ffmpeg_available(), reason="FFmpeg がない")
 def test_video(tmp_path, monkeypatch):
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "test")
+    monkeypatch.setattr("phototopost.cli.shutil.which", lambda name: "/usr/bin/" + name)
     monkeypatch.setattr("phototopost.pipeline.CaptionWriter", FakeWriter)
     src = tmp_path / "videos"
     src.mkdir()
@@ -118,3 +119,45 @@ def test_video(tmp_path, monkeypatch):
     ig = probe(out / "video_clip" / "instagram.mp4")
     assert abs(ig.width / ig.height - 9 / 16) < 0.02
     assert (out / "video_clip" / "x_cover.jpg").exists()
+
+
+def test_claude_code_backend_parses_structured_output(monkeypatch):
+    """claude -p の JSON 出力から結果を取り出せること（実際の claude は呼ばない）。"""
+    captured = {}
+
+    def fake_run(cmd, cwd, **kwargs):
+        captured["cmd"] = cmd
+        captured["files"] = sorted(p.name for p in Path(cwd).iterdir())
+        out = {
+            "type": "result", "subtype": "success", "is_error": False,
+            "structured_output": {
+                "description": "海", "subject": "波", "focus_x": 1.4, "focus_y": 0.5,
+                "quality_score": 7, "quality_notes": "", "highlight_start_seconds": 0,
+                "captions": [{"platform": "x", "text": "海", "hashtags": []}],
+            },
+        }
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(out), stderr="")
+
+    monkeypatch.setattr(ai.shutil, "which", lambda name: "/usr/bin/claude")
+    monkeypatch.setattr(ai.subprocess, "run", fake_run)
+    from phototopost.media import MediaItem
+
+    w = ai.CaptionWriter(parse_platforms("x"))
+    a = w.analyze(MediaItem(Path("a.jpg"), "photo"), [ai.Frame(Image.new("RGB", (3000, 2000)), "写真")])
+    assert a.focus_x == 1.0  # 範囲外の値は丸める
+    assert captured["files"] == ["frame1.jpg"]
+    assert captured["cmd"][captured["cmd"].index("--tools") + 1] == "Read"
+
+
+def test_claude_code_backend_reports_errors(monkeypatch):
+    def fake_run(cmd, cwd, **kwargs):
+        out = {"type": "result", "subtype": "success", "is_error": True, "result": "usage limit reached"}
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(out), stderr="")
+
+    monkeypatch.setattr(ai.shutil, "which", lambda name: "/usr/bin/claude")
+    monkeypatch.setattr(ai.subprocess, "run", fake_run)
+    from phototopost.media import MediaItem
+
+    w = ai.CaptionWriter(parse_platforms("x"))
+    with pytest.raises(ai.AIError, match="usage limit"):
+        w.analyze(MediaItem(Path("a.jpg"), "photo"), [ai.Frame(Image.new("RGB", (10, 10)), "写真")])

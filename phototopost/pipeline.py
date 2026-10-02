@@ -21,7 +21,7 @@ from .textutil import compose, count_chars, normalize_hashtags
 class Options:
     platforms: list[Platform]
     strength: float = 0.7
-    use_ai: bool = True
+    ai: str = "claude-code"  # "claude-code" / "api" / "none"
     use_location: bool = False
     style_examples: str | None = None
 
@@ -44,7 +44,11 @@ class Pipeline:
     def __init__(self, options: Options, out_dir: Path):
         self.opt = options
         self.out_dir = out_dir
-        self.writer = CaptionWriter(options.platforms, options.style_examples) if options.use_ai else None
+        self.writer = (
+            CaptionWriter(options.platforms, options.style_examples, options.ai)
+            if options.ai != "none"
+            else None
+        )
 
     def process(self, item: MediaItem) -> PostResult:
         folder = self.out_dir / _folder_name(item)

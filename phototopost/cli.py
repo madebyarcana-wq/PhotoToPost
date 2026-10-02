@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -32,7 +33,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ap.add_argument("--strength", type=float, default=0.7, help="補正の強さ 0〜1（0 で補正なし）")
     ap.add_argument("-r", "--recursive", action="store_true", help="サブフォルダも読み込む")
-    ap.add_argument("--no-ai", action="store_true", help="AI を使わない（補正とトリミングだけ）")
+    ap.add_argument(
+        "--ai", choices=["claude-code", "api", "none"], default="claude-code",
+        help="AI の呼び出し方。claude-code: claude.ai の有料プランで使う（標準）／"
+        "api: API キーで使う（従量課金）／none: 使わない",
+    )
+    ap.add_argument("--no-ai", action="store_true", help="--ai none と同じ（補正とトリミングだけ）")
     ap.add_argument("--style-file", type=Path, help="過去の投稿例を書いたテキストファイル（文体を似せる）")
     ap.add_argument("--use-location", action="store_true", help="撮影場所の位置情報を AI に渡す")
     ap.add_argument("--limit", type=int, help="処理する件数の上限（お試し用）")
@@ -50,13 +56,17 @@ def main(argv: list[str] | None = None) -> int:
         print(e, file=sys.stderr)
         return 2
 
-    use_ai = not args.no_ai
-    if use_ai and not (os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")):
+    ai_mode = "none" if args.no_ai else args.ai
+    if ai_mode == "claude-code" and not shutil.which("claude"):
         print(
-            "ANTHROPIC_API_KEY が設定されていません。投稿文の作成には API キーが必要です。\n"
+            "claude コマンドが見つかりません。Claude Code をインストールして、一度 claude を起動し\n"
+            "claude.ai のアカウントでログインしてください。\n"
             "補正とトリミングだけ行う場合は --no-ai を付けてください。",
             file=sys.stderr,
         )
+        return 2
+    if ai_mode == "api" and not (os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")):
+        print("ANTHROPIC_API_KEY が設定されていません。", file=sys.stderr)
         return 2
 
     items = scan_folder(args.folder, args.recursive)
@@ -72,7 +82,7 @@ def main(argv: list[str] | None = None) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     style = args.style_file.read_text(encoding="utf-8") if args.style_file else None
     pipeline = Pipeline(
-        Options(platforms, args.strength, use_ai, args.use_location, style), out_dir
+        Options(platforms, args.strength, ai_mode, args.use_location, style), out_dir
     )
 
     print(f"{len(items)} 件を処理します → {out_dir}")

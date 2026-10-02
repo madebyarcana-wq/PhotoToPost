@@ -30,10 +30,12 @@
    source .venv/bin/activate        # Windows は .venv\Scripts\activate
    pip install -e .
    ```
-4. **Claude の API キー** を取得（https://console.anthropic.com ）して設定
-   ```bash
-   export ANTHROPIC_API_KEY=sk-ant-...      # Windows は set ANTHROPIC_API_KEY=sk-ant-...
-   ```
+4. **Claude Code を入れてログイン**（claude.ai の有料プラン Pro / Max の範囲で使えます）
+   - Mac: `curl -fsSL https://claude.ai/install.sh | bash`
+   - Windows（PowerShell）: `irm https://claude.ai/install.ps1 | iex`
+   - インストール後、一度 `claude` と入力して起動し、表示に従って **claude.ai のアカウントでログイン** します。ログインできたら `/exit` で終了して構いません。
+
+   このツールは裏で `claude` コマンドを呼び出して写真を見せ、投稿文を作ってもらいます。API キーや追加の料金は不要です。
 
 ## 使い方
 
@@ -51,7 +53,7 @@ phototopost ~/Pictures/週末の散歩 -p all
 # 補正を弱めにする（0 で補正なし、1 で最大）
 phototopost ~/Pictures/週末の散歩 --strength 0.4
 
-# AI を使わず補正とトリミングだけ（API キー不要・無料）
+# AI を使わず補正とトリミングだけ
 phototopost ~/Pictures/週末の散歩 --no-ai
 ```
 
@@ -78,10 +80,14 @@ phototopost ~/Pictures/週末の散歩 --no-ai
     └── post.md
 ```
 
-## 料金の目安
+## 料金と利用上限
 
-AI は写真 1 枚（動画は 3 場面）につき 1 回呼び出します。モデルは標準で `claude-opus-5-5` です。
-環境変数 `PHOTOTOPOST_MODEL` で変更できます（例: `claude-sonnet-5-5` にすると安くなります）。
+- 標準では claude.ai の有料プランの範囲で動くので、**追加の料金はかかりません**。
+- ただしプランには一定時間あたりの利用上限があり、写真 1 枚（動画は 3 場面）ごとに 1 回 Claude を使います。
+  大量の写真を一度に処理すると上限に達することがあるので、`--limit` で少しずつ処理するのがおすすめです。
+  上限に達した写真はエラーとして一覧に残るので、時間をおいて再実行してください。
+- 使うモデルはプランの標準です。変えたい場合は環境変数 `PHOTOTOPOST_MODEL`（例: `sonnet`、`opus`）で指定できます。
+- API キー（従量課金）で動かしたい場合は `--ai api` を付け、環境変数 `ANTHROPIC_API_KEY` を設定してください。
 
 ## 投稿先を増やす・仕様を変える
 

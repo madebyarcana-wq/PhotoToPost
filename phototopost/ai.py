@@ -1,20 +1,33 @@
-"""Claude による写真の解析と投稿文の作成。"""
+"""Claude による写真の解析と投稿文の作成。
+
+AI の呼び出し方は 2 通り:
+- "claude-code"（標準）: Claude Code（claude コマンド）経由。claude.ai の有料プランの範囲で使える。
+- "api": Anthropic API を直接呼ぶ。API キーと従量課金が必要。
+"""
 
 from __future__ import annotations
 
 import base64
 import io
+import json
 import os
+import shutil
+import subprocess
+import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 
-import anthropic
 from PIL import Image
 from pydantic import BaseModel
 
 from .media import MediaItem
 from .platforms import Platform
 
-MODEL = os.environ.get("PHOTOTOPOST_MODEL", "claude-opus-5-5")
+# 使うモデル。claude-code では未指定ならプランの標準モデル、api では claude-opus-5-5。
+MODEL = os.environ.get("PHOTOTOPOST_MODEL")
+BACKENDS = ("claude-code", "api")
+# Claude Code 1 件あたりの待ち時間の上限（秒）
+_CLAUDE_CODE_TIMEOUT = 600
 # Claude に送る画像の長辺。これ以上大きくしても精度はほぼ変わらず、料金だけ増える。
 _SEND_LONG_EDGE = 1568
 
@@ -69,9 +82,13 @@ class Frame:
 
 
 class CaptionWriter:
-    def __init__(self, platforms: list[Platform], style_examples: str | None = None):
+    def __init__(
+        self, platforms: list[Platform], style_examples: str | None = None, backend: str = "claude-code"
+    ):
+        if backend not in BACKENDS:
+            raise ValueError(f"未対応の AI の呼び出し方です: {backend}")
         self.platforms = platforms
-        self.client = anthropic.Anthropic()
+        self.backend = backend
         system = SYSTEM_PROMPT
         if style_examples:
             system += (
@@ -79,19 +96,79 @@ class CaptionWriter:
                 "（内容はまねしないこと）。\n<examples>\n" + style_examples.strip() + "\n</examples>\n"
             )
         self.system = system
+        if backend == "api":
+            import anthropic
+
+            self.client = anthropic.Anthropic()
 
     def analyze(
         self, item: MediaItem, frames: list[Frame], duration: float | None = None,
         use_location: bool = False, note: str | None = None,
     ) -> Analysis:
+        request = self._request_text(item, duration, use_location, note)
+        if self.backend == "claude-code":
+            return _sanitize(self._via_claude_code(frames, request))
+        return _sanitize(self._via_api(frames, request))
+
+    # --- Claude Code（有料プラン）経由 ---------------------------------------
+    def _via_claude_code(self, frames: list[Frame], request: str) -> Analysis:
+        exe = shutil.which("claude")
+        if not exe:
+            raise AIError(
+                "claude コマンドが見つかりません。Claude Code をインストールし、"
+                "一度 claude を起動して claude.ai のアカウントでログインしてください。"
+            )
+        with tempfile.TemporaryDirectory(prefix="phototopost_") as tmp:
+            lines = ["次の画像ファイルを Read ツールで開いて見てください。"]
+            for n, frame in enumerate(frames, 1):
+                name = f"frame{n}.jpg"
+                _downscale(frame.image).save(Path(tmp) / name, "JPEG", quality=85)
+                lines.append(f"- {name}: {frame.label}")
+            prompt = "\n".join(lines) + "\n\n" + request
+            cmd = [
+                exe, "-p", prompt,
+                "--output-format", "json",
+                "--json-schema", json.dumps(Analysis.model_json_schema(), ensure_ascii=False),
+                "--append-system-prompt", self.system,
+                # 画像を読むことだけを許可する（ファイルの変更やコマンド実行はさせない）
+                "--tools", "Read",
+                "--allowedTools", "Read",
+                "--no-session-persistence",
+            ]
+            if MODEL:
+                cmd += ["--model", MODEL]
+            try:
+                proc = subprocess.run(
+                    cmd, cwd=tmp, capture_output=True, text=True, encoding="utf-8",
+                    timeout=_CLAUDE_CODE_TIMEOUT,
+                )
+            except subprocess.TimeoutExpired as e:
+                raise AIError("Claude Code の応答が時間内に返りませんでした。") from e
+        try:
+            data = json.loads(proc.stdout)
+        except json.JSONDecodeError as e:
+            detail = (proc.stderr or proc.stdout).strip()[:300]
+            raise AIError(f"Claude Code の実行に失敗しました: {detail}") from e
+        if data.get("is_error") or data.get("subtype") != "success":
+            # 利用上限に達したとき・ログインが切れたときなどはここに来る
+            raise AIError(f"Claude Code がエラーを返しました: {str(data.get('result', ''))[:300]}")
+        output = data.get("structured_output")
+        if output is None:
+            raise AIError("Claude Code の応答を読み取れませんでした。")
+        return Analysis.model_validate(output)
+
+    # --- Anthropic API 経由 ----------------------------------------------------
+    def _via_api(self, frames: list[Frame], request: str) -> Analysis:
+        import anthropic
+
         content: list[dict] = []
         for frame in frames:
             content.append({"type": "text", "text": frame.label})
             content.append(_image_block(frame.image))
-        content.append({"type": "text", "text": self._request_text(item, duration, use_location, note)})
+        content.append({"type": "text", "text": "上の画像について。\n" + request})
         try:
             response = self.client.beta.messages.parse(
-                model=MODEL,
+                model=MODEL or "claude-opus-5-5",
                 max_tokens=16000,
                 system=self.system,
                 messages=[{"role": "user", "content": content}],
@@ -114,12 +191,12 @@ class CaptionWriter:
             raise AIError("この写真は AI が処理を断りました。")
         if response.stop_reason == "max_tokens" or response.parsed_output is None:
             raise AIError("AI の応答を読み取れませんでした。")
-        return _sanitize(response.parsed_output)
+        return response.parsed_output
 
     def _request_text(
         self, item: MediaItem, duration: float | None, use_location: bool, note: str | None
     ) -> str:
-        lines = ["上の" + ("動画（数場面を抜き出したもの）" if item.kind == "video" else "写真") + "について答えてください。"]
+        lines = [("動画（数場面を抜き出したもの）" if item.kind == "video" else "写真") + "について答えてください。"]
         if duration:
             lines.append(f"動画の長さ: {duration:.1f} 秒")
         if item.taken_at:
@@ -137,11 +214,15 @@ class CaptionWriter:
         return "\n".join(lines)
 
 
-def _image_block(img: Image.Image) -> dict:
+def _downscale(img: Image.Image) -> Image.Image:
     img = img.copy()
     img.thumbnail((_SEND_LONG_EDGE, _SEND_LONG_EDGE))
+    return img
+
+
+def _image_block(img: Image.Image) -> dict:
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=85)
+    _downscale(img).save(buf, format="JPEG", quality=85)
     return {
         "type": "image",
         "source": {
