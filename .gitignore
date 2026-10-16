@@ -5,3 +5,4 @@ __pycache__/
 *.egg-info/
 output/
 .env
+style.txt
